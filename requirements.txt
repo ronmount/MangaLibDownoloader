@@ -1,3 +1,4 @@
 requests
 DrissionPage
 rich
+reportlab>=4,<5
