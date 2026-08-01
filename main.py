@@ -13,12 +13,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import List
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from DrissionPage import ChromiumPage
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import IntPrompt, Prompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn, MofNCompleteColumn
 
@@ -75,23 +75,54 @@ class ChapterParseResult:
     def success(self) -> bool:
         return bool(self.download_tasks)
 
+
+def title_from_url(url: str) -> str:
+    """Получает читаемое запасное название из slug MangaLib."""
+    slug = urlsplit(url).path.rstrip('/').split('/')[-1]
+    slug = re.sub(r'^\d+--', '', slug)
+    words = re.sub(r'[-_]+', ' ', slug).strip()
+    return words.title() or 'Manga'
+
+
+def with_query_parameter(url: str, name: str, value: str) -> str:
+    """Добавляет или заменяет query-параметр, сохраняя остальные параметры URL."""
+    parsed = urlsplit(url)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query[name] = value
+    return urlunsplit((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        urlencode(query),
+        parsed.fragment,
+    ))
+
+
 def get_chapters_list(url):
     with console.status("[bold blue]Получаю полный список глав...[/bold blue]", spinner="dots"):
         page = ChromiumPage()
-        page.listen.start('api/manga/') 
-        page.get(url)
-        
-        chapters = []
-        for res in page.listen.steps():
-            data = res.response.body
-            if isinstance(data, str): data = json.loads(data)
-            inner = data.get('data', data)
-            # Ищем массив, где есть объекты с полем 'number'
-            if isinstance(inner, list) and len(inner) > 0 and 'number' in inner[0]:
-                chapters = inner
-                break
-        page.quit()
-        return chapters
+        try:
+            page.listen.start('api/manga/')
+            page.get(with_query_parameter(url, 'section', 'chapters'))
+
+            chapters = []
+            manga_title = None
+            for res in page.listen.steps():
+                data = res.response.body
+                if isinstance(data, str):
+                    data = json.loads(data)
+                inner = data.get('data', data)
+                if isinstance(inner, dict) and inner.get('name'):
+                    manga_title = str(inner['name']).strip()
+                # Ищем массив, где есть объекты с полем 'number'.
+                if isinstance(inner, list) and inner and 'number' in inner[0]:
+                    chapters = inner
+                if chapters and manga_title:
+                    break
+            return chapters, manga_title or title_from_url(url)
+        finally:
+            page.quit()
+
 
 def get_pages_for_chapter(page, chapter_url: str):
     page.listen.start('api/manga/')
@@ -177,6 +208,29 @@ def number_sort_key(value: str):
         return 1, str(value)
 
 
+def format_volume_number(volume: str) -> str:
+    """Форматирует номер тома минимум двумя цифрами, сохраняя дробную часть."""
+    try:
+        normalized = format(Decimal(str(volume)).normalize(), 'f')
+    except (InvalidOperation, ValueError):
+        normalized = str(volume)
+
+    sign = ''
+    if normalized.startswith('-'):
+        sign = '-'
+        normalized = normalized[1:]
+    integer, separator, fraction = normalized.partition('.')
+    formatted = f"{sign}{integer.zfill(2)}"
+    return f"{formatted}.{fraction}" if separator and fraction else formatted
+
+
+def output_file_basename(manga_title: str, volume: str) -> str:
+    """Создаёт кроссплатформенное имя результата вида Title vol. 09."""
+    safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', '_', str(manga_title))
+    safe_title = re.sub(r'\s+', ' ', safe_title).strip(' .') or 'Manga'
+    return f"{safe_title} vol. {format_volume_number(volume)}"
+
+
 def same_volume(first: str, second: str) -> bool:
     try:
         return Decimal(str(first)) == Decimal(str(second))
@@ -213,7 +267,55 @@ def collect_volume_images(manga_folder: str, volume: str):
     return images
 
 
-def create_volume_pdf(manga_folder: str, volume: str) -> PdfResult:
+def find_existing_selected_chapters(manga_folder: str, selected_chapters):
+    """Находит выбранные главы с похожими на скачанные страницами крупнее 1 КБ."""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.avif'}
+    existing = []
+
+    for chapter in selected_chapters:
+        volume = str(chapter.get('volume', '0'))
+        number = str(chapter.get('number', '0'))
+        folder = os.path.join(manga_folder, f"v{volume}_c{number}")
+        if not os.path.isdir(folder):
+            continue
+
+        page_count = sum(
+            1
+            for file_name in os.listdir(folder)
+            if os.path.splitext(file_name)[1].lower() in image_extensions
+            and os.path.isfile(os.path.join(folder, file_name))
+            and os.path.getsize(os.path.join(folder, file_name)) > 1024
+        )
+        if page_count:
+            existing.append((chapter, folder, page_count))
+
+    return existing
+
+
+def ask_skip_existing_download(existing_chapters, selected_count: int) -> bool:
+    """Предлагает перейти к постобработке, если часть выбранных глав уже скачана."""
+    existing_page_count = sum(item[2] for item in existing_chapters)
+    console.print(
+        f"\n[bold cyan]Найдены существующие файлы: "
+        f"{len(existing_chapters)} из {selected_count} выбранных глав, "
+        f"{existing_page_count} страниц.[/bold cyan]"
+    )
+    if len(existing_chapters) < selected_count:
+        console.print(
+            "[yellow]Внимание: сохранены не все выбранные главы. "
+            "При пропуске в постобработку попадут только тома с найденными файлами.[/yellow]"
+        )
+    return Confirm.ask(
+        "[bold yellow]Пропустить сбор ссылок и загрузку изображений?[/bold yellow]",
+        default=False,
+    )
+
+
+def create_volume_pdf(
+    manga_folder: str,
+    volume: str,
+    manga_title=None,
+) -> PdfResult:
     """Создаёт один PDF из всех скачанных глав указанного тома."""
     try:
         from reportlab.lib.pagesizes import A4
@@ -241,13 +343,14 @@ def create_volume_pdf(manga_folder: str, volume: str) -> PdfResult:
 
     pdf_folder = os.path.join(manga_folder, 'pdf')
     os.makedirs(pdf_folder, exist_ok=True)
-    safe_volume = re.sub(r'[^0-9A-Za-z._-]+', '_', str(volume))
-    output_path = os.path.join(pdf_folder, f"volume_{safe_volume}.pdf")
+    manga_title = manga_title or os.path.basename(manga_folder)
+    output_basename = output_file_basename(manga_title, volume)
+    output_path = os.path.join(pdf_folder, f"{output_basename}.pdf")
     temporary_path = f"{output_path}.part"
 
     page_width, page_height = A4
     document = canvas.Canvas(temporary_path, pagesize=A4, pageCompression=1)
-    document.setTitle(f"{os.path.basename(manga_folder)} - Volume {volume}")
+    document.setTitle(f"{manga_title} - Volume {volume}")
     document.setAuthor("MangaLib Downloader")
 
     try:
@@ -278,9 +381,16 @@ def create_volume_pdf(manga_folder: str, volume: str) -> PdfResult:
     return PdfResult(str(volume), output_path, len(prepared_images))
 
 
-def create_volume_pdfs(manga_folder: str, volumes) -> List[PdfResult]:
+def create_volume_pdfs(
+    manga_folder: str,
+    volumes,
+    manga_title=None,
+) -> List[PdfResult]:
     """Создаёт PDF для каждого затронутого тома."""
-    return [create_volume_pdf(manga_folder, volume) for volume in unique_sorted_volumes(volumes)]
+    return [
+        create_volume_pdf(manga_folder, volume, manga_title)
+        for volume in unique_sorted_volumes(volumes)
+    ]
 
 
 def unique_sorted_volumes(volumes) -> List[str]:
@@ -311,7 +421,11 @@ def image_extension_from_content(image_path: str) -> str:
     return os.path.splitext(image_path)[1].lower() or '.img'
 
 
-def create_volume_cbz(manga_folder: str, volume: str) -> CbzResult:
+def create_volume_cbz(
+    manga_folder: str,
+    volume: str,
+    manga_title=None,
+) -> CbzResult:
     """Создаёт CBZ из всех скачанных глав указанного тома."""
     image_paths = collect_volume_images(manga_folder, volume)
     if not image_paths:
@@ -319,14 +433,15 @@ def create_volume_cbz(manga_folder: str, volume: str) -> CbzResult:
 
     cbz_folder = os.path.join(manga_folder, 'cbz')
     os.makedirs(cbz_folder, exist_ok=True)
-    safe_volume = re.sub(r'[^0-9A-Za-z._-]+', '_', str(volume))
-    output_path = os.path.join(cbz_folder, f"volume_{safe_volume}.cbz")
+    manga_title = manga_title or os.path.basename(manga_folder)
+    output_basename = output_file_basename(manga_title, volume)
+    output_path = os.path.join(cbz_folder, f"{output_basename}.cbz")
     temporary_path = f"{output_path}.part"
 
     try:
         with zipfile.ZipFile(temporary_path, 'w', compression=zipfile.ZIP_STORED) as archive:
             archive.comment = (
-                f"{os.path.basename(manga_folder)} - Volume {volume}"
+                f"{manga_title} - Volume {volume}"
             ).encode('utf-8')
             for page_index, image_path in enumerate(image_paths, start=1):
                 chapter_folder = os.path.basename(os.path.dirname(image_path))
@@ -349,9 +464,16 @@ def create_volume_cbz(manga_folder: str, volume: str) -> CbzResult:
     return CbzResult(str(volume), output_path, len(image_paths))
 
 
-def create_volume_cbzs(manga_folder: str, volumes) -> List[CbzResult]:
+def create_volume_cbzs(
+    manga_folder: str,
+    volumes,
+    manga_title=None,
+) -> List[CbzResult]:
     """Создаёт CBZ для каждого затронутого тома."""
-    return [create_volume_cbz(manga_folder, volume) for volume in unique_sorted_volumes(volumes)]
+    return [
+        create_volume_cbz(manga_folder, volume, manga_title)
+        for volume in unique_sorted_volumes(volumes)
+    ]
 
 
 def load_config() -> dict:
@@ -448,40 +570,90 @@ def choose_kcc_profile():
 def choose_kcc_format(category: str) -> str:
     """Предлагает форматы, подходящие выбранному семейству устройств."""
     if category == 'Kindle':
+        kindlegen_available = is_kindlegen_available()
         formats = [
-            ('EPUB', 'EPUB — для Send to Kindle, без KindleGen'),
-            ('MOBI', 'MOBI — требуется Kindle Previewer/KindleGen'),
-            ('CBZ', 'CBZ — для совместимых читалок'),
-            ('PDF', 'PDF'),
+            ('EPUB', 'EPUB — для Send to Kindle, без KindleGen', True),
+            (
+                'MOBI',
+                'MOBI — KindleGen не найден, формат недоступен'
+                if not kindlegen_available
+                else 'MOBI — через установленный KindleGen',
+                kindlegen_available,
+            ),
+            ('CBZ', 'CBZ — для совместимых читалок', True),
+            ('PDF', 'PDF', True),
         ]
     elif category == 'Kobo':
         formats = [
-            ('EPUB', 'KEPUB — оптимальный вариант для Kobo'),
-            ('CBZ', 'CBZ'),
-            ('PDF', 'PDF'),
+            ('EPUB', 'KEPUB — оптимальный вариант для Kobo', True),
+            ('CBZ', 'CBZ', True),
+            ('PDF', 'PDF', True),
         ]
     elif category == 'reMarkable':
         formats = [
-            ('PDF', 'PDF — оптимальный вариант для reMarkable'),
-            ('CBZ', 'CBZ'),
-            ('EPUB', 'EPUB'),
+            ('PDF', 'PDF — оптимальный вариант для reMarkable', True),
+            ('CBZ', 'CBZ', True),
+            ('EPUB', 'EPUB', True),
         ]
     else:
         formats = [
-            ('CBZ', 'CBZ'),
-            ('PDF', 'PDF'),
-            ('EPUB', 'EPUB'),
+            ('CBZ', 'CBZ', True),
+            ('PDF', 'PDF', True),
+            ('EPUB', 'EPUB', True),
         ]
 
     console.print("\n[bold cyan]Формат результата KCC:[/bold cyan]")
-    for index, (_, description) in enumerate(formats, start=1):
-        console.print(f"[white]{index}) {description}[/white]")
+    for index, (_, description, available) in enumerate(formats, start=1):
+        style = 'white' if available else 'dim red'
+        console.print(f"[{style}]{index}) {description}[/{style}]")
+    available_choices = [
+        str(index)
+        for index, (_, _, available) in enumerate(formats, start=1)
+        if available
+    ]
     selection = Prompt.ask(
         "[bold yellow]Выберите формат[/bold yellow]",
-        choices=[str(index) for index in range(1, len(formats) + 1)],
-        default='1',
+        choices=available_choices,
+        default=available_choices[0],
     )
     return formats[int(selection) - 1][0]
+
+
+def choose_kcc_compression(category: str, output_format: str):
+    """Выбирает баланс качества и размера для выходного файла KCC."""
+    send_to_kindle = category == 'Kindle' and output_format == 'EPUB'
+    modes = [
+        (
+            190,
+            80,
+            "Send to Kindle — JPEG 80, автоматическое деление на части до 190 МБ"
+            if send_to_kindle
+            else "Ограниченный размер — JPEG 80, автоматическое деление до 190 МБ",
+        ),
+        (
+            None,
+            None,
+            "Стандартный — настройки качества и лимита KCC по умолчанию",
+        ),
+        (
+            190,
+            70,
+            "Компактный — JPEG 70, автоматическое деление на части до 190 МБ",
+        ),
+    ]
+
+    console.print("\n[bold cyan]Размер и качество результата KCC:[/bold cyan]")
+    for index, (_, _, description) in enumerate(modes, start=1):
+        console.print(f"[white]{index}) {description}[/white]")
+
+    default = '1' if send_to_kindle else '2'
+    selection = Prompt.ask(
+        "[bold yellow]Выберите режим[/bold yellow]",
+        choices=['1', '2', '3'],
+        default=default,
+    )
+    target_size_mb, jpeg_quality, _ = modes[int(selection) - 1]
+    return target_size_mb, jpeg_quality
 
 
 def ask_positive_int(prompt: str) -> int:
@@ -508,6 +680,77 @@ def find_kcc_executable() -> str:
     )
 
 
+def find_kindlegen_executable():
+    """Находит KindleGen в PATH или внутри стандартной установки Kindle Previewer."""
+    executable = shutil.which('kindlegen')
+    if executable:
+        return executable
+
+    if os.name != 'nt':
+        return None
+
+    install_bases = [
+        os.environ.get('LOCALAPPDATA'),
+        os.environ.get('ProgramFiles'),
+        os.environ.get('ProgramFiles(x86)'),
+    ]
+    for install_base in filter(None, install_bases):
+        amazon_folder = os.path.join(install_base, 'Amazon')
+        if not os.path.isdir(amazon_folder):
+            continue
+        try:
+            previewer_folders = [
+                os.path.join(amazon_folder, folder_name)
+                for folder_name in os.listdir(amazon_folder)
+                if folder_name.lower().startswith('kindle previewer')
+            ]
+        except OSError:
+            continue
+
+        for previewer_folder in previewer_folders:
+            candidate = os.path.join(
+                previewer_folder,
+                'lib',
+                'fc',
+                'bin',
+                'kindlegen.exe',
+            )
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
+def is_kindlegen_available() -> bool:
+    """Повторяет штатную проверку KCC и не предлагает MOBI без рабочего KindleGen."""
+    executable = find_kindlegen_executable()
+    if not executable:
+        return False
+    try:
+        subprocess.run(
+            [executable, '-locale', 'en'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=15,
+        )
+        return True
+    except (FileNotFoundError, OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+
+
+def kcc_subprocess_environment():
+    """Добавляет найденный KindleGen только в PATH дочернего процесса KCC."""
+    environment = os.environ.copy()
+    executable = find_kindlegen_executable()
+    if executable:
+        executable_folder = os.path.dirname(executable)
+        current_path = environment.get('PATH', '')
+        environment['PATH'] = os.pathsep.join(
+            item for item in (executable_folder, current_path) if item
+        )
+    return environment
+
+
 def stage_kcc_images(image_paths, target_folder: str) -> None:
     """Создаёт упорядоченный входной каталог тома, по возможности через hard links."""
     os.makedirs(target_folder, exist_ok=True)
@@ -532,8 +775,17 @@ def create_volume_with_kcc(
     profile: str,
     output_format: str,
     custom_size=None,
+    target_size_mb=None,
+    jpeg_quality=None,
+    manga_title=None,
 ) -> KccResult:
     """Оптимизирует один том через официальный CLI Kindle Comic Converter."""
+    if output_format == 'MOBI' and not is_kindlegen_available():
+        raise RuntimeError(
+            "Нельзя создать MOBI: KindleGen не найден или не запускается. "
+            "Выберите EPUB для Send to Kindle либо установите Kindle Previewer/KindleGen."
+        )
+
     image_paths = collect_volume_images(manga_folder, volume)
     if not image_paths:
         raise RuntimeError(f"Для тома {volume} не найдено скачанных страниц")
@@ -542,6 +794,8 @@ def create_volume_with_kcc(
     final_folder = os.path.join(manga_folder, 'kcc')
     os.makedirs(final_folder, exist_ok=True)
     safe_volume = re.sub(r'[^0-9A-Za-z._-]+', '_', str(volume))
+    manga_title = manga_title or os.path.basename(manga_folder)
+    output_basename = output_file_basename(manga_title, volume)
 
     with tempfile.TemporaryDirectory(prefix='mangalib-kcc-') as temporary_folder:
         source_folder = os.path.join(temporary_folder, f"volume_{safe_volume}")
@@ -555,16 +809,27 @@ def create_volume_with_kcc(
             '--manga-style',
             '--format', output_format,
             '--output', output_folder,
-            '--title', f"{os.path.basename(manga_folder)} — том {volume}",
+            '--title', f"{manga_title} — том {volume}",
         ]
         if custom_size:
             command.extend([
                 '--customwidth', str(custom_size[0]),
                 '--customheight', str(custom_size[1]),
             ])
+        if target_size_mb:
+            command.extend([
+                '--targetsize', str(target_size_mb),
+                '--batchsplit', '1',
+            ])
+        if jpeg_quality:
+            command.extend(['--jpeg-quality', str(jpeg_quality)])
         command.append(source_folder)
 
-        completed = subprocess.run(command, check=False)
+        completed = subprocess.run(
+            command,
+            check=False,
+            env=kcc_subprocess_environment(),
+        )
         if completed.returncode != 0:
             raise RuntimeError(
                 f"KCC завершился с кодом {completed.returncode} для тома {volume}"
@@ -583,10 +848,10 @@ def create_volume_with_kcc(
         multiple_files = len(generated_files) > 1
         for file_index, generated_path in enumerate(generated_files, start=1):
             suffix = complete_file_suffix(generated_path)
-            part_suffix = f"_part_{file_index:02d}" if multiple_files else ""
+            part_suffix = f" part {file_index:02d}" if multiple_files else ""
             final_path = os.path.join(
                 final_folder,
-                f"volume_{safe_volume}{part_suffix}{suffix}",
+                f"{output_basename}{part_suffix}{suffix}",
             )
             temporary_path = f"{final_path}.part"
             shutil.copy2(generated_path, temporary_path)
@@ -602,6 +867,9 @@ def create_volumes_with_kcc(
     profile: str,
     output_format: str,
     custom_size=None,
+    target_size_mb=None,
+    jpeg_quality=None,
+    manga_title=None,
 ) -> List[KccResult]:
     return [
         create_volume_with_kcc(
@@ -610,9 +878,106 @@ def create_volumes_with_kcc(
             profile,
             output_format,
             custom_size,
+            target_size_mb,
+            jpeg_quality,
+            manga_title,
         )
         for volume in unique_sorted_volumes(volumes)
     ]
+
+
+def file_size_mb(path: str) -> float:
+    return os.path.getsize(path) / (1024 * 1024)
+
+
+def run_postprocessing(
+    manga_folder: str,
+    selected_volumes,
+    manga_title=None,
+) -> None:
+    """Показывает меню и запускает выбранную постобработку скачанных томов."""
+    selected_volumes = unique_sorted_volumes(selected_volumes)
+    console.print("\n[bold cyan]Что сделать с найденными изображениями?[/bold cyan]")
+    console.print("[white]1) Ничего не делать[/white]")
+    console.print("[white]2) Собрать PDF по томам[/white]")
+    console.print("[white]3) Собрать CBZ по томам[/white]")
+    console.print("[white]4) Подготовить для электронной книги через KCC[/white]")
+    postprocess_action = Prompt.ask(
+        "[bold yellow]Выберите действие[/bold yellow]",
+        choices=['1', '2', '3', '4'],
+        default='1',
+    )
+
+    if postprocess_action == '2':
+        console.print("\n[bold yellow]Формирую PDF по томам...[/bold yellow]")
+        pdf_results = create_volume_pdfs(
+            manga_folder,
+            selected_volumes,
+            manga_title,
+        )
+        for pdf_result in pdf_results:
+            console.print(
+                f"[bold green]PDF тома {pdf_result.volume}: {pdf_result.path} "
+                f"({pdf_result.page_count} стр.)[/bold green]"
+            )
+    elif postprocess_action == '3':
+        console.print("\n[bold yellow]Формирую CBZ по томам...[/bold yellow]")
+        cbz_results = create_volume_cbzs(
+            manga_folder,
+            selected_volumes,
+            manga_title,
+        )
+        for cbz_result in cbz_results:
+            console.print(
+                f"[bold green]CBZ тома {cbz_result.volume}: {cbz_result.path} "
+                f"({cbz_result.page_count} стр.)[/bold green]"
+            )
+    elif postprocess_action == '4':
+        profile, device_name, category = choose_kcc_profile()
+        output_format = choose_kcc_format(category)
+        target_size_mb, jpeg_quality = choose_kcc_compression(category, output_format)
+        custom_size = None
+        if profile == 'OTHER':
+            console.print("\n[bold cyan]Размер экрана пользовательского устройства:[/bold cyan]")
+            custom_size = (
+                ask_positive_int("[yellow]Ширина в пикселях[/yellow]"),
+                ask_positive_int("[yellow]Высота в пикселях[/yellow]"),
+            )
+
+        size_description = (
+            f", части до {target_size_mb} МБ, JPEG {jpeg_quality}"
+            if target_size_mb
+            else ", стандартное качество"
+        )
+        console.print(
+            f"\n[bold yellow]Запускаю KCC: {device_name}, формат "
+            f"{output_format}{size_description}...[/bold yellow]"
+        )
+        kcc_results = create_volumes_with_kcc(
+            manga_folder,
+            selected_volumes,
+            profile,
+            output_format,
+            custom_size,
+            target_size_mb,
+            jpeg_quality,
+            manga_title,
+        )
+        for kcc_result in kcc_results:
+            for result_path in kcc_result.paths:
+                result_size_mb = file_size_mb(result_path)
+                color = 'green' if result_size_mb < 200 else 'red'
+                console.print(
+                    f"[bold {color}]KCC тома {kcc_result.volume}: {result_path} "
+                    f"({result_size_mb:.1f} МБ)[/bold {color}]"
+                )
+                if result_size_mb >= 200:
+                    console.print(
+                        "[red]Файл всё ещё достиг 200 МБ. "
+                        "Попробуйте компактный режим KCC.[/red]"
+                    )
+    else:
+        console.print("[dim]Дополнительные файлы не создавались.[/dim]")
 
 def build_reader_url(manga_base_url: str, vol: str, num: str) -> str:
     """Генерирует правильную ссылку на читалку, удаляя '/manga/' из пути"""
@@ -682,7 +1047,7 @@ def main():
     session.headers.update({'Referer': f"{manga_base_url}/"})
     
     try:
-        all_chapters = get_chapters_list(manga_url_input)
+        all_chapters, manga_title = get_chapters_list(manga_url_input)
         if not all_chapters:
             console.print("[red]Ошибка: Список глав пуст.[/red]")
             return
@@ -715,8 +1080,32 @@ def main():
             console.print("[red]Не выбрано ни одной главы.[/red]")
             return
 
-        all_download_tasks = []
         manga_slug = manga_base_url.split('/')[-1]
+        manga_folder = os.path.join('downloads', manga_slug)
+        existing_chapters = find_existing_selected_chapters(
+            manga_folder,
+            selected_chapters,
+        )
+        if existing_chapters and ask_skip_existing_download(
+            existing_chapters,
+            len(selected_chapters),
+        ):
+            existing_volumes = [
+                chapter.get('volume')
+                for chapter, _, _ in existing_chapters
+            ]
+            console.print(
+                "[green]Загрузка изображений пропущена. "
+                "Перехожу к существующим файлам.[/green]"
+            )
+            run_postprocessing(
+                manga_folder,
+                existing_volumes,
+                manga_title,
+            )
+            return
+
+        all_download_tasks = []
         failed_chapter_parses = []
         
         with console.status("[bold blue]Инициализация браузера для сбора страниц...[/bold blue]", spinner="dots"):
@@ -813,63 +1202,12 @@ def main():
             f"{len(download_results)}. Папка: downloads/{manga_slug}[/bold rgb(0,255,0)]"
         )
 
-        manga_folder = os.path.join('downloads', manga_slug)
         selected_volumes = [chapter.get('volume') for chapter in selected_chapters]
-        console.print("\n[bold cyan]Что сделать после загрузки?[/bold cyan]")
-        console.print("[white]1) Ничего не делать[/white]")
-        console.print("[white]2) Собрать PDF по томам[/white]")
-        console.print("[white]3) Собрать CBZ по томам[/white]")
-        console.print("[white]4) Подготовить для электронной книги через KCC[/white]")
-        postprocess_action = Prompt.ask(
-            "[bold yellow]Выберите действие[/bold yellow]",
-            choices=['1', '2', '3', '4'],
-            default='1',
+        run_postprocessing(
+            manga_folder,
+            selected_volumes,
+            manga_title,
         )
-
-        if postprocess_action == '2':
-            console.print("\n[bold yellow]Формирую PDF по томам...[/bold yellow]")
-            pdf_results = create_volume_pdfs(manga_folder, selected_volumes)
-            for pdf_result in pdf_results:
-                console.print(
-                    f"[bold green]PDF тома {pdf_result.volume}: {pdf_result.path} "
-                    f"({pdf_result.page_count} стр.)[/bold green]"
-                )
-        elif postprocess_action == '3':
-            console.print("\n[bold yellow]Формирую CBZ по томам...[/bold yellow]")
-            cbz_results = create_volume_cbzs(manga_folder, selected_volumes)
-            for cbz_result in cbz_results:
-                console.print(
-                    f"[bold green]CBZ тома {cbz_result.volume}: {cbz_result.path} "
-                    f"({cbz_result.page_count} стр.)[/bold green]"
-                )
-        elif postprocess_action == '4':
-            profile, device_name, category = choose_kcc_profile()
-            output_format = choose_kcc_format(category)
-            custom_size = None
-            if profile == 'OTHER':
-                console.print("\n[bold cyan]Размер экрана пользовательского устройства:[/bold cyan]")
-                custom_size = (
-                    ask_positive_int("[yellow]Ширина в пикселях[/yellow]"),
-                    ask_positive_int("[yellow]Высота в пикселях[/yellow]"),
-                )
-
-            console.print(
-                f"\n[bold yellow]Запускаю KCC: {device_name}, формат {output_format}...[/bold yellow]"
-            )
-            kcc_results = create_volumes_with_kcc(
-                manga_folder,
-                selected_volumes,
-                profile,
-                output_format,
-                custom_size,
-            )
-            for kcc_result in kcc_results:
-                for result_path in kcc_result.paths:
-                    console.print(
-                        f"[bold green]KCC тома {kcc_result.volume}: {result_path}[/bold green]"
-                    )
-        else:
-            console.print("[dim]Дополнительные файлы не создавались.[/dim]")
 
     except Exception as e:
         console.print(f"[bold red]Ошибка программы:[/bold red] {e}")
